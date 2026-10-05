@@ -98,7 +98,7 @@ function normalizeDestination(type, raw) {
 /* ------------------------------------------------------------------ *
  * Delivery providers
  * ------------------------------------------------------------------ */
-async function deliverSms(to, message) {
+async function deliverSms(to, message, otp) {
   const provider = (process.env.SMS_PROVIDER || 'console').toLowerCase();
 
   if (provider === 'console') {
@@ -123,7 +123,12 @@ async function deliverSms(to, message) {
   }
 
   if (provider === 'msg91') {
-    // MSG91 Flow API. Requires a DLT-approved template/flow id for India.
+    // MSG91 Flow API. Requires a DLT-approved template (flow) for India.
+    // MSG91_VAR_NAME must match the variable name used inside your template
+    // (for example 'OTP' or 'VAR1'). The code is sent as that variable's value.
+    const varName = process.env.MSG91_VAR_NAME || 'OTP';
+    const recipient = { mobiles: `91${to}` };
+    recipient[varName] = otp;
     const res = await fetch('https://control.msg91.com/api/v5/flow/', {
       method: 'POST',
       headers: {
@@ -133,10 +138,14 @@ async function deliverSms(to, message) {
       body: JSON.stringify({
         template_id: process.env.MSG91_TEMPLATE_ID,
         short_url: '0',
-        recipients: [{ mobiles: `91${to}`, var: process.env.MSG91_VAR_NAME || 'OTP' }],
+        recipients: [recipient],
       }),
     });
-    if (!res.ok) throw new Error(`MSG91 ${res.status}: ${await res.text()}`);
+    const body = await res.text();
+    // MSG91 can return HTTP 200 with an error body, so check both.
+    if (!res.ok || /"type"\s*:\s*"error"/i.test(body)) {
+      throw new Error(`MSG91 ${res.status}: ${body}`);
+    }
     return;
   }
 
@@ -294,7 +303,7 @@ app.post('/api/send-otp', async (req, res) => {
     )} minutes. Do not share it with anyone.`;
 
     if (type === 'mobile') {
-      await deliverSms(normalized, message);
+      await deliverSms(normalized, message, otp);
     } else {
       await deliverEmail(normalized, 'Your BandhanJodi verification code', message);
     }
