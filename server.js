@@ -1,0 +1,354 @@
+/**
+ * BandhanJodi — Real-time OTP verification server
+ * -------------------------------------------------
+ * Endpoints (match the front-end in index.html):
+ *   GET  /api/health          -> { ok: true }
+ *   POST /api/send-otp        -> { type: 'mobile'|'email', destination }
+ *   POST /api/verify-otp      -> { destination, otp }
+ *
+ * The OTP is generated on the server, stored HASHED with a short expiry,
+ * rate-limited, and never returned to the browser. Delivery is done by a
+ * pluggable provider chosen through environment variables.
+ *
+ * No secrets are hard-coded here. Put every credential in a .env file
+ * (see .env.example) or in your hosting provider's environment settings.
+ */
+
+'use strict';
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+
+const app = express();
+
+/* ------------------------------------------------------------------ *
+ * Config
+ * ------------------------------------------------------------------ */
+const PORT = process.env.PORT || 5000;
+const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000); // 5 min
+const RESEND_COOLDOWN_MS = Number(process.env.RESEND_COOLDOWN_MS || 30 * 1000); // 30 s
+const MAX_VERIFY_ATTEMPTS = Number(process.env.MAX_VERIFY_ATTEMPTS || 5);
+const MAX_SENDS_PER_HOUR = Number(process.env.MAX_SENDS_PER_HOUR || 5); // per destination
+const OTP_SECRET = process.env.OTP_SECRET || crypto.randomBytes(32).toString('hex');
+
+// Comma-separated list of allowed browser origins (your GitHub Pages / GoDaddy site).
+// Example: https://bandhanjodi.com,https://www.bandhanjodi.com,https://<user>.github.io
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(express.json({ limit: '16kb' }));
+app.use(
+  cors({
+    origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS,
+  })
+);
+
+/* ------------------------------------------------------------------ *
+ * In-memory store
+ * NOTE: fine for a single instance. For multiple instances / restarts,
+ * swap this Map for Redis (e.g. ioredis) using the same keys.
+ * ------------------------------------------------------------------ */
+const otpStore = new Map(); // destination -> record
+const ipLog = new Map(); // ip -> [timestamps]
+
+function hashOtp(otp, destination) {
+  return crypto
+    .createHmac('sha256', OTP_SECRET)
+    .update(`${destination}:${otp}`)
+    .digest('hex');
+}
+
+function safeEqual(a, b) {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+function prune() {
+  const now = Date.now();
+  for (const [key, rec] of otpStore) {
+    if (rec.expiresAt < now) otpStore.delete(key);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Validation
+ * ------------------------------------------------------------------ */
+const MOBILE_RE = /^[6-9]\d{9}$/; // Indian 10-digit mobile
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeDestination(type, raw) {
+  const value = String(raw || '').trim();
+  if (type === 'mobile') {
+    const digits = value.replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+    return MOBILE_RE.test(digits) ? digits : null;
+  }
+  if (type === 'email') {
+    const email = value.toLowerCase();
+    return EMAIL_RE.test(email) ? email : null;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Delivery providers
+ * ------------------------------------------------------------------ */
+async function deliverSms(to, message) {
+  const provider = (process.env.SMS_PROVIDER || 'console').toLowerCase();
+
+  if (provider === 'console') {
+    console.log(`[SMS:console] to=${to} :: ${message}`);
+    return;
+  }
+
+  if (provider === 'twilio') {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN;
+    const from = process.env.TWILIO_FROM_NUMBER;
+    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ To: `+91${to}`, From: from, Body: message }),
+    });
+    if (!res.ok) throw new Error(`Twilio ${res.status}: ${await res.text()}`);
+    return;
+  }
+
+  if (provider === 'msg91') {
+    // MSG91 Flow API. Requires a DLT-approved template/flow id for India.
+    const res = await fetch('https://control.msg91.com/api/v5/flow/', {
+      method: 'POST',
+      headers: {
+        authkey: process.env.MSG91_AUTH_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        template_id: process.env.MSG91_TEMPLATE_ID,
+        short_url: '0',
+        recipients: [{ mobiles: `91${to}`, var: process.env.MSG91_VAR_NAME || 'OTP' }],
+      }),
+    });
+    if (!res.ok) throw new Error(`MSG91 ${res.status}: ${await res.text()}`);
+    return;
+  }
+
+  if (provider === 'fast2sms') {
+    const res = await fetch('https://www.fast2sms.com/dev/bulkV2', {
+      method: 'POST',
+      headers: {
+        authorization: process.env.FAST2SMS_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        route: 'q',
+        message: message,
+        numbers: to,
+        flash: 0,
+      }),
+    });
+    if (!res.ok) throw new Error(`Fast2SMS ${res.status}: ${await res.text()}`);
+    return;
+  }
+
+  throw new Error(`Unknown SMS_PROVIDER: ${provider}`);
+}
+
+async function deliverEmail(to, subject, message) {
+  const provider = (process.env.EMAIL_PROVIDER || 'console').toLowerCase();
+
+  if (provider === 'console') {
+    console.log(`[EMAIL:console] to=${to} subject="${subject}" :: ${message}`);
+    return;
+  }
+
+  if (provider === 'sendgrid') {
+    const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.SENDGRID_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: process.env.MAIL_FROM, name: process.env.MAIL_FROM_NAME || 'BandhanJodi' },
+        subject,
+        content: [{ type: 'text/plain', value: message }],
+      }),
+    });
+    if (!res.ok) throw new Error(`SendGrid ${res.status}: ${await res.text()}`);
+    return;
+  }
+
+  if (provider === 'resend') {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: process.env.MAIL_FROM,
+        to: [to],
+        subject,
+        text: message,
+      }),
+    });
+    if (!res.ok) throw new Error(`Resend ${res.status}: ${await res.text()}`);
+    return;
+  }
+
+  if (provider === 'smtp') {
+    // Optional dependency: `npm i nodemailer`
+    const nodemailer = require('nodemailer');
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT) === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM,
+      to,
+      subject,
+      text: message,
+    });
+    return;
+  }
+
+  throw new Error(`Unknown EMAIL_PROVIDER: ${provider}`);
+}
+
+/* ------------------------------------------------------------------ *
+ * Rate limiting (per destination and per IP)
+ * ------------------------------------------------------------------ */
+function checkIpLimit(ip) {
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const arr = (ipLog.get(ip) || []).filter((t) => now - t < windowMs);
+  arr.push(now);
+  ipLog.set(ip, arr);
+  return arr.length <= Number(process.env.MAX_SENDS_PER_IP_HOUR || 20);
+}
+
+/* ------------------------------------------------------------------ *
+ * Routes
+ * ------------------------------------------------------------------ */
+app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.post('/api/send-otp', async (req, res) => {
+  try {
+    prune();
+    const { type, destination } = req.body || {};
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+
+    if (!checkIpLimit(ip)) {
+      return res.status(429).json({ message: 'Too many requests. Please try again later.' });
+    }
+
+    const normalized = normalizeDestination(type, destination);
+    if (!normalized) {
+      const msg =
+        type === 'mobile'
+          ? 'Please enter a valid 10-digit Indian mobile number.'
+          : 'Please enter a valid email address.';
+      return res.status(400).json({ message: msg });
+    }
+
+    const now = Date.now();
+    const existing = otpStore.get(normalized);
+
+    if (existing && now - existing.lastSentAt < RESEND_COOLDOWN_MS) {
+      const wait = Math.ceil((RESEND_COOLDOWN_MS - (now - existing.lastSentAt)) / 1000);
+      return res.status(429).json({ message: `Please wait ${wait}s before requesting a new code.` });
+    }
+
+    // Hourly cap per destination
+    const sendTimes = (existing && existing.sendTimes ? existing.sendTimes : []).filter(
+      (t) => now - t < 60 * 60 * 1000
+    );
+    if (sendTimes.length >= MAX_SENDS_PER_HOUR) {
+      return res.status(429).json({ message: 'Too many codes requested for this number/email.' });
+    }
+    sendTimes.push(now);
+
+    const otp = String(crypto.randomInt(100000, 1000000)); // 6 digits
+    otpStore.set(normalized, {
+      otpHash: hashOtp(otp, normalized),
+      expiresAt: now + OTP_TTL_MS,
+      attempts: 0,
+      lastSentAt: now,
+      sendTimes,
+      type,
+    });
+
+    const message = `Your BandhanJodi verification code is ${otp}. It is valid for ${Math.round(
+      OTP_TTL_MS / 60000
+    )} minutes. Do not share it with anyone.`;
+
+    if (type === 'mobile') {
+      await deliverSms(normalized, message);
+    } else {
+      await deliverEmail(normalized, 'Your BandhanJodi verification code', message);
+    }
+
+    return res.json({ message: 'OTP sent successfully.' });
+  } catch (err) {
+    console.error('send-otp error:', err.message);
+    return res.status(502).json({ message: 'Could not send the code right now. Please try again.' });
+  }
+});
+
+app.post('/api/verify-otp', (req, res) => {
+  try {
+    prune();
+    const { destination, otp } = req.body || {};
+    const key = String(destination || '').trim().toLowerCase();
+    const record = otpStore.get(key);
+
+    if (!record) {
+      return res.status(400).json({ message: 'No active code for this request. Please request a new one.' });
+    }
+    if (Date.now() > record.expiresAt) {
+      otpStore.delete(key);
+      return res.status(400).json({ message: 'This code has expired. Please request a new one.' });
+    }
+    if (record.attempts >= MAX_VERIFY_ATTEMPTS) {
+      otpStore.delete(key);
+      return res.status(429).json({ message: 'Too many incorrect attempts. Please request a new code.' });
+    }
+
+    record.attempts += 1;
+    const submitted = String(otp || '').trim();
+    const ok = safeEqual(record.otpHash, hashOtp(submitted, key));
+
+    if (!ok) {
+      return res.status(400).json({ message: 'Invalid code. Please check and try again.' });
+    }
+
+    otpStore.delete(key); // one-time use
+
+    // TODO: create a real session / JWT here and return it.
+    // e.g. const token = jwt.sign({ sub: key }, JWT_SECRET, { expiresIn: '7d' });
+    //      return res.json({ message: 'Verified', token });
+    return res.json({ message: 'Verified successfully.', verified: true });
+  } catch (err) {
+    console.error('verify-otp error:', err.message);
+    return res.status(500).json({ message: 'Verification failed. Please try again.' });
+  }
+});
+
+app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
+
+app.listen(PORT, () => {
+  console.log(`BandhanJodi OTP server listening on port ${PORT}`);
+  console.log(`SMS provider: ${process.env.SMS_PROVIDER || 'console'}`);
+  console.log(`Email provider: ${process.env.EMAIL_PROVIDER || 'console'}`);
+});
