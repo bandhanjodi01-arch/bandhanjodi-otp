@@ -252,6 +252,18 @@ function checkIpLimit(ip) {
  * ------------------------------------------------------------------ */
 app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// Reports this server's OUTBOUND public IP - the address MSG91/Twilio see when
+// the server calls their API. Handy for provider IP-whitelisting.
+app.get('/api/ip', async (_req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const j = await r.json();
+    res.json({ outbound_ip: j.ip });
+  } catch (err) {
+    res.status(502).json({ message: 'Could not determine outbound IP.' });
+  }
+});
+
 app.post('/api/send-otp', async (req, res) => {
   try {
     prune();
