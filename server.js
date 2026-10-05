@@ -253,15 +253,26 @@ function checkIpLimit(ip) {
 app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Reports this server's OUTBOUND public IP - the address MSG91/Twilio see when
-// the server calls their API. Handy for provider IP-whitelisting.
+// the server calls their API. Tries several echo services.
 app.get('/api/ip', async (_req, res) => {
-  try {
-    const r = await fetch('https://api.ipify.org?format=json');
-    const j = await r.json();
-    res.json({ outbound_ip: j.ip });
-  } catch (err) {
-    res.status(502).json({ message: 'Could not determine outbound IP.' });
+  const services = [
+    ['checkip', 'https://checkip.amazonaws.com'],
+    ['icanhazip', 'https://icanhazip.com'],
+    ['ipify', 'https://api.ipify.org'],
+  ];
+  const checks = {};
+  let ip = null;
+  for (const [name, url] of services) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const text = (await r.text()).trim();
+      checks[name] = { status: r.status, text: text.slice(0, 120) };
+      if (!ip && /^[0-9a-fA-F:.]+$/.test(text)) ip = text;
+    } catch (err) {
+      checks[name] = { error: String((err && err.message) || err) };
+    }
   }
+  res.json({ outbound_ip: ip, checks });
 });
 
 app.post('/api/send-otp', async (req, res) => {
