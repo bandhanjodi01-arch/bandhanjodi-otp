@@ -20,6 +20,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
@@ -40,7 +42,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
   .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(express.json({ limit: '16kb' }));
+app.use(express.json({ limit: '4mb' }));
 app.use(
   cors({
     origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS,
@@ -98,7 +100,7 @@ function normalizeDestination(type, raw) {
 /* ------------------------------------------------------------------ *
  * Delivery providers
  * ------------------------------------------------------------------ */
-async function deliverSms(to, message, otp) {
+async function deliverSms(to, message) {
   const provider = (process.env.SMS_PROVIDER || 'console').toLowerCase();
 
   if (provider === 'console') {
@@ -123,12 +125,7 @@ async function deliverSms(to, message, otp) {
   }
 
   if (provider === 'msg91') {
-    // MSG91 Flow API. Requires a DLT-approved template (flow) for India.
-    // MSG91_VAR_NAME must match the variable name used inside your template
-    // (for example 'OTP' or 'VAR1'). The code is sent as that variable's value.
-    const varName = process.env.MSG91_VAR_NAME || 'OTP';
-    const recipient = { mobiles: `91${to}` };
-    recipient[varName] = otp;
+    // MSG91 Flow API. Requires a DLT-approved template/flow id for India.
     const res = await fetch('https://control.msg91.com/api/v5/flow/', {
       method: 'POST',
       headers: {
@@ -138,14 +135,10 @@ async function deliverSms(to, message, otp) {
       body: JSON.stringify({
         template_id: process.env.MSG91_TEMPLATE_ID,
         short_url: '0',
-        recipients: [recipient],
+        recipients: [{ mobiles: `91${to}`, var: process.env.MSG91_VAR_NAME || 'OTP' }],
       }),
     });
-    const body = await res.text();
-    // MSG91 can return HTTP 200 with an error body, so check both.
-    if (!res.ok || /"type"\s*:\s*"error"/i.test(body)) {
-      throw new Error(`MSG91 ${res.status}: ${body}`);
-    }
+    if (!res.ok) throw new Error(`MSG91 ${res.status}: ${await res.text()}`);
     return;
   }
 
@@ -250,30 +243,73 @@ function checkIpLimit(ip) {
 /* ------------------------------------------------------------------ *
  * Routes
  * ------------------------------------------------------------------ */
-app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// Reports this server's OUTBOUND public IP - the address MSG91/Twilio see when
-// the server calls their API. Tries several echo services.
-app.get('/api/ip', async (_req, res) => {
-  const services = [
-    ['checkip', 'https://checkip.amazonaws.com'],
-    ['icanhazip', 'https://icanhazip.com'],
-    ['ipify', 'https://api.ipify.org'],
-  ];
-  const checks = {};
-  let ip = null;
-  for (const [name, url] of services) {
-    try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      const text = (await r.text()).trim();
-      checks[name] = { status: r.status, text: text.slice(0, 120) };
-      if (!ip && /^[0-9a-fA-F:.]+$/.test(text)) ip = text;
-    } catch (err) {
-      checks[name] = { error: String((err && err.message) || err) };
-    }
+/* ------------------------------------------------------------------ *
+ * Account storage  (saved profiles / login records)
+ * Uses PostgreSQL when DATABASE_URL is set, otherwise a local JSON file.
+ * ------------------------------------------------------------------ */
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'accounts.json');
+let pgPool = null;
+if (process.env.DATABASE_URL) {
+  try {
+    const { Pool } = require('pg');
+    pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  } catch (e) {
+    console.warn('pg not installed - falling back to file storage');
   }
-  res.json({ outbound_ip: ip, checks });
-});
+}
+
+async function initStore() {
+  if (pgPool) {
+    await pgPool.query('CREATE TABLE IF NOT EXISTS accounts (key text PRIMARY KEY, data jsonb NOT NULL, updated_at timestamptz DEFAULT now())');
+    console.log('account store: PostgreSQL');
+    return;
+  }
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+  console.log('account store: JSON file at ' + DATA_FILE);
+}
+
+function readFileAccounts() {
+  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) || {}; } catch (e) { return {}; }
+}
+function writeFileAccounts(o) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(DATA_FILE, JSON.stringify(o, null, 2)); }
+  catch (e) { console.error('account write failed:', e.message); }
+}
+
+async function upsertAccount(key, data) {
+  key = String(key || '').toLowerCase().trim();
+  if (!key) return false;
+  if (pgPool) {
+    await pgPool.query(
+      'INSERT INTO accounts (key, data, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()',
+      [key, data]
+    );
+    return true;
+  }
+  const all = readFileAccounts(); all[key] = data; writeFileAccounts(all); return true;
+}
+
+async function listAccounts() {
+  if (pgPool) {
+    const r = await pgPool.query('SELECT key, data, updated_at FROM accounts ORDER BY updated_at DESC');
+    return r.rows.map(function (x) { return Object.assign({ _key: x.key, _updated: x.updated_at }, x.data); });
+  }
+  const all = readFileAccounts();
+  return Object.keys(all).map(function (k) { return Object.assign({ _key: k }, all[k]); });
+}
+
+function requireAdmin(req, res, next) {
+  const key = req.query.key || req.headers['x-admin-key'];
+  if (!process.env.ADMIN_KEY) return res.status(503).json({ message: 'Admin key not configured on the server.' });
+  if (key !== process.env.ADMIN_KEY) return res.status(401).json({ message: 'Unauthorized' });
+  next();
+}
+
+const CSV_COLS = ['_key','id','firstName','lastName','gender','dob','phone','email','religion','community','subCommunity','motherTongue','country','state','city','education','profession','income','maritalStatus','height','diet','complexion','ethnicity','drink','smoke','familyStatus','fatherName','fatherOccupation','motherName','motherOccupation','brotherName','sisterName','about','prefMarital','prefReligion','prefEducation','prefCountry','prefDrinking','prefSmoking','ageFrom','ageTo','accountType','plan','verified','_updated'];
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.post('/api/send-otp', async (req, res) => {
   try {
@@ -326,7 +362,7 @@ app.post('/api/send-otp', async (req, res) => {
     )} minutes. Do not share it with anyone.`;
 
     if (type === 'mobile') {
-      await deliverSms(normalized, message, otp);
+      await deliverSms(normalized, message);
     } else {
       await deliverEmail(normalized, 'Your BandhanJodi verification code', message);
     }
@@ -377,7 +413,51 @@ app.post('/api/verify-otp', (req, res) => {
   }
 });
 
+
+// ---- save a profile / account record ----
+app.post('/api/save-profile', async (req, res) => {
+  try {
+    const profile = (req.body || {}).profile;
+    if (!profile || typeof profile !== 'object') return res.status(400).json({ message: 'profile required' });
+    const key = (profile.email || profile.phone || '').toLowerCase().trim();
+    if (!key) return res.status(400).json({ message: 'profile needs an email or phone' });
+    await upsertAccount(key, profile);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('save-profile error:', err.message);
+    return res.status(500).json({ message: 'Could not save profile.' });
+  }
+});
+
+// ---- admin: list all accounts ----
+app.get('/api/admin/accounts', cors(), requireAdmin, async (req, res) => {
+  try {
+    const list = await listAccounts();
+    return res.json({ count: list.length, accounts: list });
+  } catch (err) {
+    console.error('admin accounts error:', err.message);
+    return res.status(500).json({ message: 'Could not load accounts.' });
+  }
+});
+
+// ---- admin: download CSV ----
+app.get('/api/admin/export.csv', cors(), requireAdmin, async (req, res) => {
+  try {
+    const list = await listAccounts();
+    const esc = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
+    let csv = CSV_COLS.join(',') + '\n';
+    list.forEach(function (a) { csv += CSV_COLS.map(function (c) { return esc(a[c]); }).join(',') + '\n'; });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="bandhanjodi-accounts.csv"');
+    return res.send(csv);
+  } catch (err) {
+    return res.status(500).json({ message: 'Could not export.' });
+  }
+});
+
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
+
+initStore().catch(function (e) { console.warn('store init failed:', e.message); });
 
 app.listen(PORT, () => {
   console.log(`BandhanJodi OTP server listening on port ${PORT}`);
