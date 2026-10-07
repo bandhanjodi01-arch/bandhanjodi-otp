@@ -337,13 +337,29 @@ app.get('/api/ip', async (_req, res) => {
   res.json({ outbound_ip: ip, checks });
 });
 
-app.get('/api/health', (_req, res) => res.json({
-  ok: true,
-  ts: Date.now(),
-  adminKeySet: !!process.env.ADMIN_KEY,
-  dbConfigured: !!process.env.DATABASE_URL,
-  store: pgPool ? 'postgres' : 'file'
-}));
+app.get('/api/health', async (_req, res) => {
+  const out = {
+    ok: true,
+    ts: Date.now(),
+    adminKeySet: !!process.env.ADMIN_KEY,
+    dbConfigured: !!process.env.DATABASE_URL,
+    store: pgPool ? 'postgres' : 'file',
+    dbReachable: null,
+    accounts: null,
+    dbError: null
+  };
+  if (pgPool) {
+    try {
+      const r = await pgPool.query('SELECT count(*)::int AS n FROM accounts');
+      out.dbReachable = true;
+      out.accounts = r.rows[0].n;
+    } catch (e) {
+      out.dbReachable = false;
+      out.dbError = String((e && e.message) || e).slice(0, 200);
+    }
+  }
+  res.json(out);
+});
 
 app.post('/api/send-otp', async (req, res) => {
   try {
