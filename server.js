@@ -515,6 +515,67 @@ app.get('/api/admin/export.csv', cors(), requireAdmin, async (req, res) => {
   }
 });
 
+
+// ---- public: list profiles for the matches deck (no email/phone exposed) ----
+app.get('/api/profiles', cors(), async (_req, res) => {
+  try {
+    const list = await listAccounts();
+    const ageFromDob = function (dob) {
+      if (!dob) return null;
+      const parts = String(dob).split(/[\/\-.]/).map(function (x) { return parseInt(x, 10); });
+      let d = null, m = null, y = null;
+      if (parts.length === 3 && parts.every(function (n) { return !isNaN(n); })) {
+        if (parts[0] > 1900) { y = parts[0]; m = parts[1]; d = parts[2]; }
+        else { d = parts[0]; m = parts[1]; y = parts[2]; }
+      }
+      if (!y || !m || !d) return null;
+      const now = new Date();
+      let a = now.getFullYear() - y;
+      if (((now.getMonth() + 1) * 100 + now.getDate()) < (m * 100 + d)) a--;
+      return (a > 0 && a < 100) ? a : null;
+    };
+    const profiles = list
+      .filter(function (a) { return a && (a.firstName || a.lastName); })
+      .map(function (a) {
+        const name = [a.firstName, a.lastName].filter(Boolean).join(' ') || 'Member';
+        const badges = [];
+        if (a.verified) badges.push('Verified');
+        if (a.accountType === 'premium') badges.push('Premium');
+        if (a.plan) badges.push(a.plan);
+        return {
+          id: a.id || name,
+          name: name,
+          age: ageFromDob(a.dob),
+          height: a.height || '',
+          location: [a.city, a.state, a.country].filter(Boolean).join(', '),
+          caste: [a.community, a.subCommunity].filter(Boolean).join(' - '),
+          profession: a.profession || '',
+          income: a.income || '',
+          education: a.education || '',
+          maritalStatus: a.maritalStatus || '',
+          managedBy: a.profileFor || 'Self',
+          diet: a.diet || '', drink: a.drink || '', smoke: a.smoke || '',
+          family: a.familyStatus || '',
+          about: a.about || '',
+          lastActive: a.accountType === 'premium' ? 'Active today' : 'Recently',
+          verified: !!a.verified,
+          premium: a.accountType === 'premium',
+          photosCount: a.photo ? 1 : 0,
+          image: a.photo || '',
+          badges: badges.length ? badges : ['Member']
+        };
+      })
+      .sort(function (x, y) {
+        return ((y.verified ? 1 : 0) - (x.verified ? 1 : 0)) || ((y.premium ? 1 : 0) - (x.premium ? 1 : 0));
+      })
+      .slice(0, 60);
+    res.json({ count: profiles.length, profiles: profiles });
+  } catch (err) {
+    console.error('profiles error:', err.message);
+    res.status(500).json({ message: 'Could not load profiles.' });
+  }
+});
+
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
 
 initStore().catch(function (e) { console.warn('store init failed:', e.message); });
