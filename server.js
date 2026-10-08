@@ -623,6 +623,26 @@ app.get('/api/chat-status', cors(), async (req, res) => {
   }
 });
 
+
+// ---- admin: activate / deactivate premium membership for a client ----
+app.post('/api/admin/set-premium', cors(), requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const key = String(body.key || '').toLowerCase().trim();
+    if (!key) return res.status(400).json({ message: 'key required' });
+    const rec = (await getAccount(key)) || {};
+    const on = (body.premium !== false);
+    rec.accountType = on ? 'premium' : 'local';
+    rec.verified = on ? true : false;
+    if (on && !rec.plan) rec.plan = 'Admin Activated';
+    await upsertAccount(key, rec);
+    return res.json({ ok: true, key: key, accountType: rec.accountType, verified: rec.verified });
+  } catch (err) {
+    console.error('set-premium error:', err.message);
+    return res.status(500).json({ message: 'Could not update membership.' });
+  }
+});
+
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
 
 initStore().catch(function (e) { console.warn('store init failed:', e.message); });
