@@ -346,13 +346,23 @@ app.get('/api/health', async (_req, res) => {
     store: pgPool ? 'postgres' : 'file',
     dbReachable: null,
     accounts: null,
+    accountsTable: null,
+    database: null,
+    schema: null,
     dbError: null
   };
   if (pgPool) {
     try {
-      const r = await pgPool.query('SELECT count(*)::int AS n FROM accounts');
+      const d = await pgPool.query('SELECT current_database() AS db, current_schema() AS sch');
+      out.database = d.rows[0].db;
+      out.schema = d.rows[0].sch;
+      const t = await pgPool.query("SELECT to_regclass('public.accounts') IS NOT NULL AS ok");
+      out.accountsTable = t.rows[0].ok;
+      if (out.accountsTable) {
+        const r = await pgPool.query('SELECT count(*)::int AS n FROM accounts');
+        out.accounts = r.rows[0].n;
+      }
       out.dbReachable = true;
-      out.accounts = r.rows[0].n;
     } catch (e) {
       out.dbReachable = false;
       out.dbError = String((e && e.message) || e).slice(0, 200);
