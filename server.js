@@ -298,6 +298,17 @@ async function upsertAccount(key, data) {
   const all = readFileAccounts(); all[key] = data; writeFileAccounts(all); return true;
 }
 
+async function getAccount(key) {
+  key = String(key || '').toLowerCase().trim();
+  if (!key) return null;
+  if (pgPool) {
+    const r = await pgPool.query('SELECT data FROM accounts WHERE key = $1', [key]);
+    return r.rows[0] ? r.rows[0].data : null;
+  }
+  const all = readFileAccounts();
+  return all[key] || null;
+}
+
 async function listAccounts() {
   if (pgPool) {
     const r = await pgPool.query('SELECT key, data, updated_at FROM accounts ORDER BY updated_at DESC');
@@ -481,6 +492,13 @@ app.post('/api/save-profile', async (req, res) => {
     if (!profile || typeof profile !== 'object') return res.status(400).json({ message: 'profile required' });
     const key = (profile.email || profile.phone || '').toLowerCase().trim();
     if (!key) return res.status(400).json({ message: 'profile needs an email or phone' });
+    // never let a client-side save wipe admin-controlled state
+    const prev = (await getAccount(key)) || {};
+    if (prev.chatUnlocked) profile.chatUnlocked = true;
+    if (prev.paidChats) profile.paidChats = prev.paidChats;
+    if (prev.plan && !profile.plan) profile.plan = prev.plan;
+    if (prev.verified) profile.verified = true;
+    if (prev.accountType === 'premium') profile.accountType = 'premium';
     await upsertAccount(key, profile);
     return res.json({ ok: true });
   } catch (err) {
@@ -573,6 +591,35 @@ app.get('/api/profiles', cors(), async (_req, res) => {
   } catch (err) {
     console.error('profiles error:', err.message);
     res.status(500).json({ message: 'Could not load profiles.' });
+  }
+});
+
+
+// ---- admin: unlock / lock chat access for a client ----
+app.post('/api/admin/unlock-chat', cors(), requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const key = String(body.key || '').toLowerCase().trim();
+    if (!key) return res.status(400).json({ message: 'key required' });
+    const rec = (await getAccount(key)) || {};
+    rec.chatUnlocked = (body.unlocked === false) ? false : true;
+    await upsertAccount(key, rec);
+    return res.json({ ok: true, key: key, chatUnlocked: rec.chatUnlocked });
+  } catch (err) {
+    console.error('unlock-chat error:', err.message);
+    return res.status(500).json({ message: 'Could not update chat access.' });
+  }
+});
+
+// ---- public: does this client have chat access? ----
+app.get('/api/chat-status', cors(), async (req, res) => {
+  try {
+    const key = String(req.query.key || '').toLowerCase().trim();
+    if (!key) return res.json({ unlocked: false });
+    const rec = (await getAccount(key)) || {};
+    return res.json({ unlocked: !!rec.chatUnlocked, paidChats: rec.paidChats || [] });
+  } catch (err) {
+    return res.json({ unlocked: false });
   }
 });
 
